@@ -89,4 +89,110 @@ Core components (as used in the project):
 
 ---
 
-## 4. Dataset & Data Col
+## 4. Dataset & Data Collection
+
+The dataset consists of **IMU recordings of four gestures** performed by users, recorded using the wearable.
+
+### 4.1 Recording protocol
+
+1. User wears the device on the wrist.
+2. OLED menu offers a **“Record Gesture Data”** option.
+3. Once selected, the device:
+   - Samples IMU at target **100 Hz** (effective ~90–93 Hz)
+   - Logs 6 channels (AccelX/Y/Z, GyroX/Y/Z) to a **CSV** on the microSD card
+   - Records for **4 seconds per trial**, then automatically stops
+4. Gestures are performed following a **reference video** to standardize motion:
+   - Pinch, Pan, Lift, Idle
+
+Each recording yields:
+
+- ~**400 samples per 4 s** gesture file  
+- Later segmented into **1 s windows → 4 windows per gesture trial**
+
+### 4.2 Preprocessing
+
+For each gesture file:
+
+- **Structural checks**
+  - Ensure 400 rows, continuous timestamps, all 6 IMU channels present  
+- **Time-domain inspection**
+  - Signals plotted (MATLAB / Python) to check for flatlines, spikes, and noise
+- **Statistical profile**
+  - Per-axis mean, standard deviation, min, max, and range
+  - Used to detect sensor clipping, idle segments, drift, etc.
+
+### 4.3 Segmentation
+
+- **Window length:** 1000 ms (1 s)  
+- **Stride:** 1000 ms (non-overlapping)  
+- **Windows per 4 s file:** 4  
+- Each window becomes one **training sample** of shape `(N_samples, 6)` where `N_samples ≈ 90–93`.
+
+---
+
+## 5. Machine Learning Pipeline (Edge Impulse)
+
+All model development is done in **Edge Impulse Studio**.
+
+### 5.1 Signal processing
+
+- **Input:** 6-axis IMU time-series windows (`AccelX/Y/Z`, `GyroX/Y/Z`)  
+- **Sampling frequency:** explicitly set to **≈ 90.9 Hz** in Edge Impulse to match measured data  
+- **Processing block:** **Spectral Analysis (FFT)**  
+  - FFT computed for each axis  
+  - Only the useful portion of the spectrum retained (leveraging symmetry for real signals)  
+  - **Normalization disabled** → raw magnitudes preserved to keep motion amplitude meaningful  
+  - **No decimation** → full time resolution remains
+
+### 5.2 Model
+
+- **Type:** Small fully connected neural network (multiclass classifier)
+- **Input:** Concatenated FFT feature vector
+- **Output:** Softmax over 4 gesture classes:
+  - `IDLE`, `LIFT`, `PAN`, `PINCH`
+- **Training:**
+  - Loss: categorical cross-entropy
+  - Optimizer: Adam
+  - Trained and tuned directly in Edge Impulse Studio
+
+### 5.3 Performance
+
+(Replace with the exact numbers from your EI dashboard if needed.)
+
+- Validation accuracy: **≈ 99%**
+- Test-set accuracy on **624 windows:** **≈ 99.7%**  
+- Weighted precision, recall, and F1-score: **≈ 1.00**
+- Only a **small number of misclassifications** (e.g. a Lift window misread as Pinch)
+- **On-device inference:**  
+  - Latency **< 20 ms** per 1 s window on Arduino Nano 33 BLE Sense Rev2  
+
+---
+
+## 6. On-Device Application Logic
+
+The wearable firmware follows this main loop:
+
+1. **Initialization**
+   - Set up I²C, SPI, serial, OLED, IMU, SD card
+   - Display a boot message and menu on the OLED
+
+2. **Menu**
+   - Options such as:
+     - Record gesture data
+     - Run live classification
+     - (Any additional modes you’ve implemented)
+
+3. **Data acquisition mode**
+   - For recording:
+     - Log IMU data to CSV on SD for 4 seconds
+     - Return to menu when done
+
+4. **Inference mode**
+   - Continuously read IMU samples into a 1 s buffer
+   - Wrap buffer into an `EI_SIGNAL_T` (Edge Impulse signal)
+   - Call `run_classifier(&signal, &result, false);`
+   - Read output probabilities and pick the top class
+   - Display gesture label on OLED (and/or LEDs / serial output)
+
+The same core model is used both for **offline dataset generation** and **live real-time gesture recognition**.
+
