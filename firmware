@@ -7,7 +7,7 @@
 #include <Arduino_APDS9960.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <PINCH_PAN_FIANL_inferencing.h>
+#include <pinch_pan_flip_idle_inferencing.h>
 
 #include <math.h>
 #include <string.h>
