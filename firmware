@@ -1,1 +1,439 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Arduino_BMI270_BMM150.h>
+#include <Arduino_LPS22HB.h>
+#include <Arduino_HS300x.h>
+#include <Arduino_APDS9960.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <PINCH_PAN_FIANL_inferencing.h>
 
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+
+// SD card CS pin
+const int chipSelect = 4;
+
+// Navigation buttons
+const int btnUpPin     = 6;
+const int btnDownPin   = 7;
+const int btnSelectPin = 8;
+const int btnBackPin   = 9;
+
+// OLED display
+#define SCREEN_WIDTH     128
+#define SCREEN_HEIGHT    64
+#define OLED_RESET       -1
+#define OLED_I2C_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Sensor-fusion globals
+#define CONVERT_G_TO_MS2   9.80665f
+#define MAX_ACCEPTED_RANGE 2.0f
+#define N_SENSORS          18
+
+static float   data[N_SENSORS];
+static int8_t  fusion_sensors[N_SENSORS];
+static int     fusion_ix = 0;
+enum sensor_status { NOT_USED = -1, NOT_INIT, INIT, SAMPLED };
+
+typedef struct {
+    const char    *name;
+    float         *value;
+    uint8_t       (*poll_sensor)(void);
+    bool          (*init_sensor)(void);
+    sensor_status  status;
+} eiSensors;
+
+// — init & poll implementations ——————————————————————————————————————
+
+bool init_IMU(void){ static bool b=false; if(!b) b=IMU.begin(); return b; }
+bool init_HTS(void){ static bool b=false; if(!b) b=HS300x.begin(); return b; }
+bool init_BARO(void){static bool b=false; if(!b) b=BARO.begin(); return b; }
+bool init_APDS(void){static bool b=false; if(!b) b=APDS.begin(); return b; }
+
+uint8_t poll_acc(void){
+    if(IMU.accelerationAvailable()){
+        float x,y,z; IMU.readAcceleration(x,y,z);
+        float arr[3]={x,y,z};
+        for(int i=0;i<3;i++){
+            float v=arr[i];
+            if(fabs(v)>MAX_ACCEPTED_RANGE)
+                v=(v>=0?MAX_ACCEPTED_RANGE:-MAX_ACCEPTED_RANGE);
+            data[i]=v*CONVERT_G_TO_MS2;
+        }
+    }
+    return 0;
+}
+uint8_t poll_gyr(void){
+    if(IMU.gyroscopeAvailable()) IMU.readGyroscope(data[3],data[4],data[5]);
+    return 0;
+}
+uint8_t poll_mag(void){
+    if(IMU.magneticFieldAvailable()) IMU.readMagneticField(data[6],data[7],data[8]);
+    return 0;
+}
+uint8_t poll_HTS(void){
+    data[9]=HS300x.readTemperature();
+    data[10]=HS300x.readHumidity();
+    return 0;
+}
+uint8_t poll_BARO(void){
+    data[11]=BARO.readPressure();
+    return 0;
+}
+uint8_t poll_APDS_color(void){
+    int r,g,b,br;
+    if(APDS.colorAvailable()){
+        APDS.readColor(r,g,b,br);
+        data[12]=r; data[13]=g; data[14]=b; data[15]=br;
+    }
+    return 0;
+}
+uint8_t poll_APDS_proximity(void){
+    if(APDS.proximityAvailable()) data[16]=(float)APDS.readProximity();
+    return 0;
+}
+uint8_t poll_APDS_gesture(void){
+    if(APDS.gestureAvailable()) data[17]=(float)APDS.readGesture();
+    return 0;
+}
+
+// — sensors[] array ——————————————————————————————————————————————
+
+eiSensors sensors[] = {
+    "accX",       &data[0],  poll_acc,            init_IMU,  NOT_USED,
+    "accY",       &data[1],  poll_acc,            init_IMU,  NOT_USED,
+    "accZ",       &data[2],  poll_acc,            init_IMU,  NOT_USED,
+    "gyrX",       &data[3],  poll_gyr,            init_IMU,  NOT_USED,
+    "gyrY",       &data[4],  poll_gyr,            init_IMU,  NOT_USED,
+    "gyrZ",       &data[5],  poll_gyr,            init_IMU,  NOT_USED,
+    "magX",       &data[6],  poll_mag,            init_IMU,  NOT_USED,
+    "magY",       &data[7],  poll_mag,            init_IMU,  NOT_USED,
+    "magZ",       &data[8],  poll_mag,            init_IMU,  NOT_USED,
+    "temperature",&data[9],  poll_HTS,            init_HTS,  NOT_USED,
+    "humidity",   &data[10], poll_HTS,            init_HTS,  NOT_USED,
+    "pressure",   &data[11], poll_BARO,           init_BARO, NOT_USED,
+    "red",        &data[12], poll_APDS_color,     init_APDS, NOT_USED,
+    "green",      &data[13], poll_APDS_color,     init_APDS, NOT_USED,
+    "blue",       &data[14], poll_APDS_color,     init_APDS, NOT_USED,
+    "brightness", &data[15], poll_APDS_color,     init_APDS, NOT_USED,
+    "proximity",  &data[16], poll_APDS_proximity, init_APDS, NOT_USED,
+    "gesture",    &data[17], poll_APDS_gesture,   init_APDS, NOT_USED,
+};
+
+// — build fusion list —————————————————————————————————————————————
+
+static bool ei_connect_fusion_list(const char *input_list){
+    char *copy = (char*)ei_malloc(strlen(input_list)+1);
+    if(!copy) return false;
+    strcpy(copy, input_list);
+    fusion_ix = 0;
+    bool any = false;
+    for(char* tok = strtok(copy, "+ "); tok; tok = strtok(NULL, "+ ")) {
+        for(int i=0; i<N_SENSORS; i++) {
+            if(strstr(tok, sensors[i].name)) {
+                fusion_sensors[fusion_ix++] = i;
+                sensors[i].status = NOT_INIT;
+                any = true;
+                break;
+            }
+        }
+    }
+    ei_free(copy);
+    return any;
+}
+
+// — single-run inference ——————————————————————————————————————————
+
+bool runSingleInference(ei_impulse_result_t &result){
+    float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE] = {0};
+    for(size_t ix=0; ix<EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE; ix+=EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME){
+        int64_t nt = (int64_t)micros() + EI_CLASSIFIER_INTERVAL_MS*1000LL;
+        for(int i=0; i<fusion_ix; i++){
+            int idx = fusion_sensors[i];
+            if(sensors[idx].status == INIT){
+                sensors[idx].poll_sensor();
+                sensors[idx].status = SAMPLED;
+            }
+            if(sensors[idx].status == SAMPLED){
+                buffer[ix + i] = *sensors[idx].value;
+                sensors[idx].status = INIT;
+            }
+        }
+        int64_t wt = nt - (int64_t)micros();
+        if(wt > 0) delayMicroseconds(wt);
+    }
+    signal_t signal;
+    if(numpy::signal_from_buffer(buffer, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal) != 0) return false;
+    if(run_classifier(&signal, &result, false) != EI_IMPULSE_OK) return false;
+    return true;
+}
+
+// — display inference result ——————————————————————————————————————————
+
+void classifyOnce(){
+    ei_impulse_result_t res;
+    if(!runSingleInference(res)){
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0,0);
+        display.println("Error");
+        display.display();
+        return;
+    }
+    int best = 0;
+    float bv = res.classification[0].value;
+    for(int i=1; i<EI_CLASSIFIER_LABEL_COUNT; i++){
+        if(res.classification[i].value > bv){
+            bv = res.classification[i].value;
+            best = i;
+        }
+    }
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0,0);
+    display.println("Result:");
+    display.setTextSize(2);
+    display.setCursor(0,16);
+    display.println(res.classification[best].label);
+    display.display();
+}
+
+// — state machine & menus ——————————————————————————————————————————
+
+enum AppState { MAIN_MENU, RECORD_MENU, LOG_MENU, RUN_MODEL } state = MAIN_MENU;
+
+const char* mainMenuItems[] = { "Record Gesture", "View Logs", "Run Model" };
+const int   mainMenuCount   = sizeof(mainMenuItems) / sizeof(mainMenuItems[0]);
+int         mainMenuIndex  = 0;
+
+const char* recordMenuItems[] = { "Pinch", "Pan", "Side" };
+const int   recordMenuCount   = sizeof(recordMenuItems) / sizeof(recordMenuItems[0]);
+int         recordMenuIndex   = 0;
+
+const int   logDisplayCount = 4;
+int         logIndex        = 0;
+char        logFiles[20][13];
+int         logFileCount    = 0;
+
+// — utilities ——————————————————————————————————————————————————————
+
+String getNextFilename(const char* g) {
+    int idx = 1;
+    String n;
+    do {
+        n = String(g) + String(idx++) + ".csv";
+    } while (SD.exists(n.c_str()));
+    return n;
+}
+
+void displayError(const char* m) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0,0);
+    display.println(m);
+    display.display();
+    while (1);
+}
+
+void startRecording(const char* g) {
+    for(int i=3; i>0; i--){
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0,0);
+        display.print("Starting in ");
+        display.print(i);
+        display.display();
+        delay(1000);
+    }
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0,0);
+    display.println("Recording");
+    display.display();
+    if(!SD.begin(chipSelect)) displayError("SD init fail");
+    if(!IMU.begin())          displayError("IMU init fail");
+
+    String fn = getNextFilename(g);
+    File f = SD.open(fn.c_str(), FILE_WRITE);
+    if(!f) displayError("File open error");
+    f.println("t,Ax,Ay,Az,Gx,Gy,Gz");
+
+    unsigned long st = millis(), pm = micros();
+    while(millis()-st < 5000){
+        unsigned long cm = micros();
+        if(cm - pm >= 5000){
+            pm = cm;
+            if(IMU.accelerationAvailable()) IMU.readAcceleration(data[0],data[1],data[2]);
+            if(IMU.gyroscopeAvailable())    IMU.readGyroscope(data[3],data[4],data[5]);
+            f.print(millis()); f.print(',');
+            f.print(data[0],6); f.print(',');
+            f.print(data[1],6); f.print(',');
+            f.print(data[2],6); f.print(',');
+            f.print(data[3],6); f.print(',');
+            f.print(data[4],6); f.print(',');
+            f.println(data[5],6);
+        }
+        if(!digitalRead(btnBackPin)) break;
+    }
+    f.close();
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0,0);
+    display.println("Saved as:");
+    display.setCursor(0,10);
+    display.println(fn);
+    display.display();
+    delay(2000);
+}
+
+void loadLogFiles() {
+    File root = SD.open("/");
+    logFileCount = 0;
+    while(true) {
+        File e = root.openNextFile();
+        if(!e) break;
+        if(!e.isDirectory()) {
+            String s = e.name();
+            String lower = s; lower.toLowerCase();
+            if(lower.endsWith(".csv") && logFileCount < 20) {
+                s.toCharArray(logFiles[logFileCount], sizeof(logFiles[0]));
+                logFileCount++;
+            }
+        }
+        e.close();
+    }
+    root.close();
+    logIndex = 0;
+    Serial.print("Found "); Serial.print(logFileCount); Serial.println(" log(s)");
+}
+
+void displayLogFiles() {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0,0);
+    display.println("Logs:");
+    for(int i=0; i<logDisplayCount; i++){
+        int fi = logIndex + i;
+        display.setCursor(0, 10*(i+1));
+        if(fi < logFileCount){
+            display.print(fi==logIndex?"> ":"  ");
+            display.println(logFiles[fi]);
+        }
+    }
+    display.display();
+}
+
+void displayMenu(const char* it[], int cnt, int idx) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    for(int i=0; i<cnt; i++){
+        display.setCursor(0, 10*i);
+        display.print(i==idx?"> ":"  ");
+        display.println(it[i]);
+    }
+    display.display();
+}
+
+bool pressUp()    { if(!digitalRead(btnUpPin))     { delay(200); return true;} return false; }
+bool pressDown()  { if(!digitalRead(btnDownPin))   { delay(200); return true;} return false; }
+bool pressSelect(){ if(!digitalRead(btnSelectPin)) { delay(200); return true;} return false; }
+bool pressBack()  { if(!digitalRead(btnBackPin))   { delay(200); return true;} return false; }
+
+// — setup & loop ——————————————————————————————————————————————————
+
+void setup() {
+    Serial.begin(9600); while(!Serial);
+    if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS)) while(1);
+
+    // Splash
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0,0);
+    display.println("Gesture recognition");
+    display.println("   device");
+    display.display();
+    delay(2000);
+
+    if(!SD.begin(chipSelect)) displayError("SD init fail");
+    if(!ei_connect_fusion_list(EI_CLASSIFIER_FUSION_AXES_STRING)) displayError("Fusion init fail");
+    for(int i=0; i<fusion_ix; i++){
+        int idx = fusion_sensors[i];
+        sensors[idx].status = (sensor_status)sensors[idx].init_sensor();
+    }
+
+    pinMode(btnUpPin,     INPUT_PULLUP);
+    pinMode(btnDownPin,   INPUT_PULLUP);
+    pinMode(btnSelectPin, INPUT_PULLUP);
+    pinMode(btnBackPin,   INPUT_PULLUP);
+
+    state = MAIN_MENU;
+    displayMenu(mainMenuItems, mainMenuCount, mainMenuIndex);
+}
+
+void loop() {
+    switch(state) {
+      case MAIN_MENU:
+        if(pressUp())    mainMenuIndex = (mainMenuIndex + mainMenuCount - 1) % mainMenuCount;
+        if(pressDown())  mainMenuIndex = (mainMenuIndex + 1) % mainMenuCount;
+        if(pressSelect()){
+          if(mainMenuIndex==0) {
+            state = RECORD_MENU;
+          }
+          else if(mainMenuIndex==1) {
+            loadLogFiles();
+            if(logFileCount==0){
+              display.clearDisplay();
+              display.setTextSize(1);
+              display.setCursor(0,0);
+              display.println("No logs");
+              display.display();
+              delay(2000);
+              state = MAIN_MENU;
+            }
+            else {
+              state = LOG_MENU;
+            }
+          }
+          else {
+            state = RUN_MODEL;
+          }
+        }
+        displayMenu(mainMenuItems, mainMenuCount, mainMenuIndex);
+        break;
+
+      case RECORD_MENU:
+        if(pressUp())    recordMenuIndex = (recordMenuIndex + recordMenuCount - 1) % recordMenuCount;
+        if(pressDown())  recordMenuIndex = (recordMenuIndex + 1) % recordMenuCount;
+        if(pressSelect()){ startRecording(recordMenuItems[recordMenuIndex]); state = MAIN_MENU; }
+        if(pressBack())   state = MAIN_MENU;
+        displayMenu(recordMenuItems, recordMenuCount, recordMenuIndex);
+        break;
+
+      case LOG_MENU:
+        if(pressUp()   && logIndex>0)                             logIndex--;
+        if(pressDown() && logIndex<logFileCount-logDisplayCount)  logIndex++;
+        if(pressBack()) state = MAIN_MENU;
+        displayLogFiles();
+        break;
+
+      case RUN_MODEL:
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0,0);
+        display.println("Listening...");
+        display.display();
+
+        classifyOnce();
+        delay(5000);
+
+        state = MAIN_MENU;
+        displayMenu(mainMenuItems, mainMenuCount, mainMenuIndex);
+        break;          
+    }
+}
